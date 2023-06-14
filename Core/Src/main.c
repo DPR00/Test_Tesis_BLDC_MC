@@ -37,11 +37,14 @@
 
 // Definiciones principales
 #define POLE_PAIRS 23u
-#define VOLTAJE 30u
+#define VOLTAJE 48u
 #define STEP_ADC_RPM 10u
 #define ESTIMATION_RATE 5u // solo puede ser divisor de 10 {1, 2, 5, 10}.
 
 #define STEPS2RPM 60*ESTIMATION_RATE/POLE_PAIRS/6 // 60 segundos, 2 Hz, 23 pp, 6 pasos
+#define RPM2KMH 1/10.44
+#define SPEED_UNITS 0u		// 0 for RPM, 1 for KMH
+#define TELEMETRY 0u		// 0 for normal operation, 1 for telemetry
 
 #define TEST_STANLEY 1u
 
@@ -51,8 +54,8 @@
 /* Controller parameters */
 // Para ESTIMATION_RATE de 2u: kp = 0.2; ki = 0.8; kd=0.0 (delay 700u)
 //						   5u: kp = 0.02; ki = 0.5; kd=0.0 (delay 700u)
-#define PID_KP  0.03f //
-#define PID_KI  0.35f // 0.15 0.01
+#define PID_KP  0.1f //
+#define PID_KI  0.6f // 0.15 0.01
 #define PID_KD  0.0f //0.0
 
 #define PID_TAU 0.02f
@@ -62,7 +65,20 @@
 
 #define STANLEY_K 	3.5f
 #define STANLEY_KS 	0.2f
+
 #define SAMPLE_TIME_S 0.1f
+
+/* CAN data */
+
+//Position of the respective data flags
+
+#define GF 0u  	// General flag
+#define PW 1u	// Power flag
+#define EM 2u	// Emergency flag
+#define SU 3u	// Speed unit		0 para RPM, 1 para KMH
+#define CS0 4u	// Cruise Speed 0
+#define CS1 5u	// Cruise Speed 1
+
 
 /* USER CODE END PD */
 
@@ -114,6 +130,8 @@ void bldc_move_back(void);
 
 //funciones adicionales
 void delay_us (uint16_t us);
+void send_can_pos(float actX, float actY);
+void send_can_vel(void);
 
 
 // VARIABLES
@@ -142,10 +160,11 @@ int16_t euler_data[3];
 float yaw = 0;
 
 // Stanley
-float posX = 0.0;
-float posY = 0.0;
-float ang_direc = 0.0;
-float steer = 0.0;
+float posX = 0.0f;
+float posY = 0.0f;
+float ang_direc = 0.0f;
+float steer = 0.0f;
+float arr_path[4]={0.0, 0.0, 0.0, 0.0};
 
 float stepsPAP = 0.0;
 
@@ -155,12 +174,22 @@ uint8_t timer4_flag = 0;
 uint8_t timer4_counts = 0;
 uint8_t estimation_flag = 0;
 
+//CAN VARIABLES
+uint8_t CAN_FLAG_REG;	// Register of flags for can
+CAN_TxHeaderTypeDef TxHeader;
+CAN_RxHeaderTypeDef RxHeader;
+uint32_t TxMailbox;
+uint32_t FreeMailbox; // Check the amount of mailboxes free
+uint8_t TxData[8];
+uint8_t RxData[8];
+
 
 //PID
 PIDController pid = { PID_KP, PID_KI, PID_KD, PID_TAU,
 						PID_LIM_MIN, PID_LIM_MAX, SAMPLE_TIME_S };
 
 StanleyController stanley = {STANLEY_K, STANLEY_KS};
+
 
 /* USER CODE END 0 */
 
@@ -225,6 +254,43 @@ int main(void)
   HAL_GPIO_WritePin(B_LOW_GPIO_Port , B_LOW_Pin,  GPIO_PIN_RESET);
   HAL_GPIO_WritePin(C_LOW_GPIO_Port , C_LOW_Pin,  GPIO_PIN_RESET);
 
+  //CAN
+  HAL_CAN_Start(&hcan);
+  //CAN FIFO activation
+  HAL_CAN_ActivateNotification(&hcan, CAN_IT_RX_FIFO0_MSG_PENDING);
+
+//Configurando la transmision
+  TxHeader.DLC = 8;  // Son 8 bytes de data
+  TxHeader.ExtId = 0;
+  TxHeader.IDE = CAN_ID_STD; //Identificador del mensaje
+  TxHeader.RTR = CAN_RTR_DATA;
+  TxHeader.StdId = 0x103;  // Este es el ID que mandaremos al periferico
+  TxHeader.TransmitGlobalTime = DISABLE;
+
+  // CAN_FLAG_REG Initialization
+  CAN_FLAG_REG |=  (1<<GF);	// General Flag 1 (necessary)
+  CAN_FLAG_REG = (CAN_FLAG_REG & (~(1 << SU))) | (SPEED_UNITS << SU); // speed unit setting a
+  CAN_FLAG_REG &= ~(1<<EM); // No Emergency
+  CAN_FLAG_REG &= ~(1<<PW); // Initial OFF
+  CAN_FLAG_REG &= ~(1<<CS0); //
+  CAN_FLAG_REG &= ~(1<<CS1); // Cruise speed
+
+  TxData[0] = 0; 	//Speed component
+  TxData[1] = 0;	//Speed component
+  TxData[2] = 0;	//Duty Cycle
+  TxData[3] = 0;	// ...
+  TxData[4] = 0;	// ...
+  TxData[5] = 0;	// ...
+  TxData[6] = 0;	// ...
+  TxData[7] = CAN_FLAG_REG;	//Flags byte  [0 0 0 0 0 0 0 1] [x x cs cs su em pw gf]
+
+  // x: not defined
+  // cs: cruice speed (0 to 3)
+  // su: speed units (0 for RPM, 1 for km/h)
+  // em: emergency ( 1 for alert)
+  // pw: Power flag (0 off, 1 on)
+  // gf: general flag (1 always)
+
   // Incializamos el led de testeo apagado
   HAL_GPIO_WritePin(GPIOC , GPIO_PIN_13,  GPIO_PIN_SET);
 
@@ -238,7 +304,19 @@ int main(void)
   while (1)
   {
 	  if (timer2_flag == 1){
-		  get_adc();
+		  if (!TELEMETRY) {
+			  get_adc();
+		  }
+		  else {
+			  if(TEST_STANLEY==1){
+				  if(RxData[6]==255 && RxData[7]==255){
+					  desired_speed_rpm = RxData[0] + RxData[1];
+				  }
+			  }else{
+				  desired_speed_rpm = RxData[0] + RxData[1];
+			  }
+
+		  }
 		  read_hall();
 
 		  if (direction == 0) bldc_move();
@@ -276,10 +354,18 @@ int main(void)
 
 			  float *arr_currPos;
 			  arr_currPos = calcular_posActual(posX, posY, current_speed_rpm, yaw, ang_direc, SAMPLE_TIME_S);
+			  posX = arr_currPos[0];
+			  posY = arr_currPos[1];
 
-			  // Recibir por CAN
-			  float arrpath[4]={0.0, 0.0, 0.0, 0.0} // x0, y0, x1, y1. Se deberia recibir por CAN
-			  // Recibir por CAN
+			  send_can_pos(posX, posY);	// Enviamos la data de Pos por CAN
+
+			  if(RxData[6]!= 255 && RxData[7]!= 255){
+				  	arr_path[0] = RxData[0] + RxData[1]*0.001f;
+				  	arr_path[1] = RxData[2] + RxData[3]*0.001f;
+				  	arr_path[2] = RxData[4] + RxData[5]*0.001f;
+				  	arr_path[3] = RxData[6] + RxData[7]*0.001f;
+
+			  }
 
 			  steer = StanleyController_Update(&stanley, yaw, current_speed_rpm, arr_currPos, arr_path);
 
@@ -295,6 +381,7 @@ int main(void)
 	  if (estimation_flag){
 		  // HAL_GPIO_TogglePin(GPIOC , GPIO_PIN_13);
 		  current_speed_rpm = steps*STEPS2RPM;
+		  send_can_vel();	// Enviamos la data de vel por CAN
 		  estimation_flag = 0;
 		  steps = 0;
 	  }
@@ -1002,7 +1089,65 @@ void delay_us(uint16_t us){
 	__HAL_TIM_SET_COUNTER(&htim3,0);  // set the counter value a 0
 	while (__HAL_TIM_GET_COUNTER(&htim3) < us);  // wait for the counter to reach the us input in the parameter
 }
-//INTERRUPCIONES
+
+void send_can_pos(float actX, float actY){
+
+	uint8_t x0_int = (int) actX;
+    uint8_t x0_float = (int)(100*(actX - x0_int));
+    uint8_t y0_int = (int) actY;
+    uint8_t y0_float = (int)(100*(actY - y0_int));
+
+	TxData[0] = x0_int;
+	TxData[1] = x0_float;
+	TxData[2] = y0_int;
+	TxData[3] = y0_float;
+	TxData[4] = 100;
+	TxData[5] = 100;
+	TxData[6] = 100;
+	TxData[7] = 100;
+
+	HAL_CAN_AddTxMessage(&hcan, &TxHeader, TxData, &TxMailbox);
+
+}
+
+void send_can_vel(void){
+
+	if (SPEED_UNITS == 0){
+		// Current speed (RPM)
+		if (current_speed_rpm > 255){
+				TxData[0] = 255;
+				TxData[1] = current_speed_rpm - 255;
+		}
+		else{
+			TxData[0] = current_speed_rpm;
+			TxData[1] = 0;
+		}
+		// Desired speed (RPM)
+		if (desired_speed_rpm > 255){
+				TxData[3] = 255;
+				TxData[4] = desired_speed_rpm - 255;
+		}
+		else{
+			TxData[3] = desired_speed_rpm;
+			TxData[4] = 0;
+		}
+	}
+	else{
+		// KMPH
+		TxData[0] = current_speed_rpm*RPM2KMH;
+		TxData[1] = 0;
+
+	}
+
+	// Alojamos el duty cycle
+	TxData[2] = duty_cycle;
+
+	TxData[6] = 255;
+	TxData[7] = 255;	// Actualizamos con los flag
+
+	HAL_CAN_AddTxMessage(&hcan, &TxHeader, TxData, &TxMailbox);
+
+}
 
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim){
 
@@ -1023,6 +1168,11 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim){
 		timer4_counts += 1;
 	}
 }
+
+void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan){
+	HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &RxHeader, RxData);
+}
+
 /* USER CODE END 4 */
 
 /**

@@ -20,6 +20,7 @@ typedef struct {
 
 float normalizeAngle(float angle);
 float *polyFit(float x0, float x1, float y0, float y1);
+float *calcular_posActual(float posX, float posY, float current_speed_rpm, float yaw, float ang_direc, float T);
 void StanleyController_Init(StanleyController *stanley);
 float StanleyController_Update(StanleyController *stanley, float yaw, float vel, float arr_currPos[], float arr_path[]);
 void StanleyController_Reset(StanleyController *stanley);
